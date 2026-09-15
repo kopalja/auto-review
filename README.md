@@ -1,5 +1,7 @@
 # GitHub PR reviewer
 
+**Checks PRs in monitored GitHub repositories and generates reviews using codex.**
+
 Python standard-library runner for this Raspberry Pi. Uses `gh` for GitHub operations and the existing Codex ChatGPT login for Astra reviews. Runs sequentially under a nonblocking file lock.
 
 ## Repositories and defaults
