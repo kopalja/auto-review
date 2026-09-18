@@ -273,6 +273,34 @@ class BoundaryTests(unittest.TestCase):
             self.assertIn(('merge-base', 'b' * 40, 'a' * 40), calls)
             self.assertEqual(files, {})
 
+    def test_new_file_content_is_not_duplicated_outside_diff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            gen = review.Generator(review.DEFAULTS, Path(directory))
+            def fake(cache, *args, **kwargs):
+                if args[0] in ('init', 'fetch'):
+                    return b''
+                if args[0] == 'rev-parse':
+                    return b'a' * 40
+                if args[0] == 'merge-base':
+                    return b'c' * 40
+                if args[0] == 'diff' and '--name-only' in args:
+                    return b'new.py\0'
+                if args[0] == 'diff' and '--numstat' in args:
+                    return b'1\t0\tnew.py\n'
+                if args[0] == 'diff':
+                    return b'+unique new content\n'
+                if args[0] == 'ls-tree':
+                    return b'100644 blob hash\tnew.py\n' if args[1] == 'a' * 40 else b''
+                if args[0] == 'show':
+                    return b'unique new content\n'
+                raise AssertionError(args)
+            gen.git_command = fake
+            row = dict(repo='owner/repo', number=5, head='a' * 40, base='b' * 40)
+            prompt, files = gen.context(row, pr())
+            payload = json.loads(prompt.split('UNTRUSTED REVIEW DATA:\n', 1)[1])
+            self.assertEqual(payload['files']['new.py'], '(new file; full contents are included in the diff)')
+            self.assertEqual(files, {'new.py': 1})
+
 
 class RecoveryTests(ReviewerFixture):
     def test_publication_recovery_survives_discovery_of_new_base(self):
