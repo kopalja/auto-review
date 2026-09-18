@@ -408,11 +408,18 @@ class Generator:
                 if not mode.startswith((b'100644 ', b'100755 ')):
                     raise Limited('Symlink or submodule changes require manual review')
                 text = self.git_command(cache, 'show', f"{row['head']}:{path}", limit=self.cfg['max_context_bytes'])
-                used += len(text)
-                if used > self.cfg['max_context_bytes'] or b'\0' in text:
+                if b'\0' in text:
                     raise Limited('Source context exceeds limit or contains binary data')
-                context[path] = text.decode('utf-8')
-                files[path] = max(1, len(context[path].splitlines()))
+                decoded = text.decode('utf-8')
+                files[path] = max(1, len(decoded.splitlines()))
+                old_mode = self.git_command(cache, 'ls-tree', ancestor, '--', path)
+                if not old_mode:
+                    context[path] = '(new file; full contents are included in the diff)'
+                    continue
+                used += len(text)
+                if used > self.cfg['max_context_bytes']:
+                    raise Limited('Source context exceeds limit or contains binary data')
+                context[path] = decoded
             payload = {'repository': row['repo'], 'number': row['number'], 'head': row['head'],
                        'base': row['base'], 'merge_base': ancestor, 'title': pr.get('title', ''),
                        'description': pr.get('body') or '', 'diff': diff.decode('utf-8'), 'files': context}
