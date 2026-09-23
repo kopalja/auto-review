@@ -99,7 +99,7 @@ Status and failed-job retry:
 ./bin/run --state-dir var/dry-run --status
 ```
 
-Retries preserve already-generated output after a posting failure. Deterministic comment markers and publisher-ID checks reconcile accepted posts after crashes or lost HTTP responses. SQLite retains revision identities so unchanged commits do not duplicate reviews. Exhausted retries remain `failed` until explicitly retried. Oversized/binary/symlink/submodule changes are `skipped` for manual review.
+Retries preserve already-generated output after a posting failure. Deterministic comment markers and publisher-ID checks reconcile accepted posts after crashes or lost HTTP responses. SQLite retains revision identities so unchanged commits do not duplicate reviews. Exhausted retries remain `failed` until explicitly retried. Binary file contents are omitted while remaining text changes are reviewed; oversized, symlink, and submodule changes are `skipped` for manual review.
 
 ## Scheduling
 
