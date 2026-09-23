@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sequential GitHub PR reviewer. Python standard library only."""
+"""GitHub PR reviewer running Codex and Claude side by side. Python standard library only."""
 import argparse
 import contextlib
 import fcntl
@@ -18,6 +18,7 @@ import signal
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
 
 from isolation import worker
@@ -26,7 +27,12 @@ ROOT = Path(__file__).resolve().parent
 REPO = re.compile(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z')
 SHA = re.compile(r'[0-9a-f]{40}\Z')
 REASONING_LEVELS = ('low', 'medium', 'high', 'xhigh', 'max', 'ultra')
-DEFAULTS = dict(model='gpt-6-astra', reasoning_effort='high', max_reviews=3, review_timeout=900,
+CLAUDE_REASONING_LEVELS = ('low', 'medium', 'high', 'xhigh', 'max')
+CLAUDE_MODEL = 'claude-opus-5-5'
+REVIEWERS = ('codex', 'claude')
+NAMES = {'codex': 'Codex', 'claude': 'Claude'}
+DEFAULTS = dict(model='gpt-6-astra', reasoning_effort='high', claude_reasoning_effort='high',
+                reviewers=list(REVIEWERS), max_reviews=3, review_timeout=900,
                 max_attempts=3, retry_seconds=600, max_files=60,
                 max_diff_bytes=200000, max_context_bytes=500000,
                 max_cache_bytes=1073741824, min_free_bytes=536870912,
@@ -49,13 +55,19 @@ def config(path):
     if not isinstance(raw, dict) or set(raw) - (set(DEFAULTS) | {'repositories', 'discover_local_repositories'}):
         raise Failure('Invalid configuration keys')
     settings = DEFAULTS | raw
-    for key in DEFAULTS.keys() - {'model', 'reasoning_effort'}:
+    for key in DEFAULTS.keys() - {'model', 'reasoning_effort', 'claude_reasoning_effort', 'reviewers'}:
         if type(settings[key]) is not int or settings[key] <= 0:
             raise Failure(f'{key} must be a positive integer')
     if settings['model'] not in ('gpt-5.6-sol', 'gpt-6-astra'):
         raise Failure('Unsupported model')
     if settings['reasoning_effort'] not in REASONING_LEVELS:
         raise Failure('reasoning_effort must be one of: ' + ', '.join(REASONING_LEVELS))
+    if settings['claude_reasoning_effort'] not in CLAUDE_REASONING_LEVELS:
+        raise Failure('claude_reasoning_effort must be one of: ' + ', '.join(CLAUDE_REASONING_LEVELS))
+    reviewers = settings['reviewers']
+    if (not isinstance(reviewers, list) or not reviewers or len(set(reviewers)) != len(reviewers)
+            or any(r not in REVIEWERS for r in reviewers)):
+        raise Failure('reviewers must be a non-empty list of: ' + ', '.join(REVIEWERS))
     entries = settings.get('repositories', [])
     if not isinstance(entries, list):
         raise Failure('repositories must be a list')
@@ -222,20 +234,35 @@ class GitHub:
         return self.api(f'repos/{repo}/issues/{number}/comments', {'body': body})['id']
 
 
-def database(path):
-    db = sqlite3.connect(path)
-    db.row_factory = sqlite3.Row
-    db.executescript('''
-    PRAGMA journal_mode=WAL;
-    CREATE TABLE IF NOT EXISTS repositories(name TEXT PRIMARY KEY, last_served REAL NOT NULL DEFAULT 0);
-    CREATE TABLE IF NOT EXISTS revisions(
-      repo TEXT NOT NULL, number INTEGER NOT NULL, head TEXT NOT NULL, base TEXT NOT NULL,
-      model TEXT NOT NULL, status TEXT NOT NULL, discovered REAL NOT NULL,
+REVISIONS = '''revisions(
+      repo TEXT NOT NULL, number INTEGER NOT NULL, head TEXT NOT NULL, reviewer TEXT NOT NULL,
+      base TEXT NOT NULL, model TEXT NOT NULL, status TEXT NOT NULL, discovered REAL NOT NULL,
       generation_attempts INTEGER NOT NULL DEFAULT 0, publication_attempts INTEGER NOT NULL DEFAULT 0,
       next_retry REAL NOT NULL DEFAULT 0, body TEXT, publication_id INTEGER,
       error TEXT, duration REAL, updated REAL NOT NULL,
-      PRIMARY KEY(repo, number, head));
+      PRIMARY KEY(repo, number, head, reviewer))'''
+COLUMNS = ('repo,number,head,base,model,status,discovered,generation_attempts,publication_attempts,'
+           'next_retry,body,publication_id,error,duration,updated')
+
+
+def database(path):
+    db = sqlite3.connect(path)
+    db.row_factory = sqlite3.Row
+    db.executescript(f'''
+    PRAGMA journal_mode=WAL;
+    CREATE TABLE IF NOT EXISTS repositories(name TEXT PRIMARY KEY, last_served REAL NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS {REVISIONS};
     ''')
+    if 'reviewer' not in {c['name'] for c in db.execute('PRAGMA table_info(revisions)')}:
+        # State from before Claude reviews: every existing revision is a Codex review.
+        db.executescript(f'''
+        BEGIN;
+        ALTER TABLE revisions RENAME TO revisions_codex;
+        CREATE TABLE {REVISIONS};
+        INSERT INTO revisions({COLUMNS},reviewer) SELECT {COLUMNS},'codex' FROM revisions_codex;
+        DROP TABLE revisions_codex;
+        COMMIT;
+        ''')
     return db
 
 
@@ -249,8 +276,9 @@ def identity(pr):
         raise Failure('Invalid GitHub PR identity') from exc
 
 
-def discover(db, repo, model, pulls, backfill=False):
+def discover(db, repo, model, pulls, backfill=False, reviewers=REVIEWERS):
     now = time.time()
+    models = {'codex': model, 'claude': CLAUDE_MODEL}
     # Validate all entries before committing a baseline.
     identities = [(pr, identity(pr)) for pr in pulls]
     first = not db.execute('SELECT 1 FROM repositories WHERE name=?', (repo,)).fetchone()
@@ -262,32 +290,44 @@ def discover(db, repo, model, pulls, backfill=False):
             if pr.get('draft', False):
                 continue  # Drafts are never baselined, so ready transitions are eligible.
             status = 'baseline' if first and not backfill else 'pending'
-            db.execute('INSERT OR IGNORE INTO revisions(repo,number,head,base,model,status,discovered,updated) VALUES(?,?,?,?,?,?,?,?)',
-                       (repo, number, head, base, model, status, now, now))
+            known = {r[0] for r in db.execute('SELECT status FROM revisions WHERE repo=? AND number=? AND head=?',
+                                              (repo, number, head))}
+            # Reviewers join only unseen heads, so adding one never reviews old history.
+            if not known or (backfill and known == {'baseline'}):
+                for reviewer in reviewers:
+                    db.execute('INSERT OR IGNORE INTO revisions(repo,number,head,reviewer,base,model,status,discovered,updated) VALUES(?,?,?,?,?,?,?,?,?)',
+                               (repo, number, head, reviewer, base, models[reviewer], status, now, now))
             if backfill:
                 db.execute("UPDATE revisions SET status='pending',updated=? WHERE repo=? AND number=? AND head=? AND status='baseline'",
                            (now, repo, number, head))
-            db.execute("UPDATE revisions SET status='pending',base=?,model=?,generation_attempts=0,publication_attempts=0,next_retry=0,error=NULL,updated=? WHERE repo=? AND number=? AND head=? AND status='superseded'",
+            db.execute("UPDATE revisions SET status='pending',base=?,model=CASE reviewer WHEN 'codex' THEN ? ELSE model END,generation_attempts=0,publication_attempts=0,next_retry=0,error=NULL,updated=? WHERE repo=? AND number=? AND head=? AND status='superseded'",
                        (base, model, now, repo, number, head))
             # Base changes update unfinished work only; completed heads never re-review.
             db.execute("UPDATE revisions SET base=?,status='pending',body=NULL,generation_attempts=0,publication_attempts=0,next_retry=0,error=NULL,updated=? WHERE repo=? AND number=? AND head=? AND base!=? AND body IS NULL AND status IN ('pending','failed')",
                        (base, now, repo, number, head, base))
         # Generated bodies must reach reconciliation even if the PR changed or closed.
-        for row in db.execute("SELECT number,head FROM revisions WHERE repo=? AND body IS NULL AND status IN ('pending','failed')", (repo,)).fetchall():
+        for row in db.execute("SELECT number,head,reviewer FROM revisions WHERE repo=? AND body IS NULL AND status IN ('pending','failed')", (repo,)).fetchall():
             if (row['number'], row['head']) not in active:
-                db.execute("UPDATE revisions SET status='superseded',body=NULL,updated=? WHERE repo=? AND number=? AND head=?",
-                           (now, repo, row['number'], row['head']))
+                db.execute("UPDATE revisions SET status='superseded',body=NULL,updated=? WHERE repo=? AND number=? AND head=? AND reviewer=?",
+                           (now, repo, row['number'], row['head'], row['reviewer']))
 
 
 def update(db, row, **fields):
     fields['updated'] = time.time()
     with db:
-        db.execute(f'UPDATE revisions SET {",".join(k+"=?" for k in fields)} WHERE repo=? AND number=? AND head=?',
-                   (*fields.values(), row['repo'], row['number'], row['head']))
+        db.execute(f'UPDATE revisions SET {",".join(k+"=?" for k in fields)} WHERE repo=? AND number=? AND head=? AND reviewer=?',
+                   (*fields.values(), *key(row)))
+
+
+def key(row):
+    return row['repo'], row['number'], row['head'], row['reviewer']
 
 
 def marker(row):
-    digest = hashlib.sha256(f"{row['repo']}:{row['number']}:{row['head']}".encode()).hexdigest()
+    subject = f"{row['repo']}:{row['number']}:{row['head']}"
+    if row['reviewer'] != 'codex':
+        subject += ':' + row['reviewer']  # Codex keeps its original marker so older posts reconcile.
+    digest = hashlib.sha256(subject.encode()).hexdigest()
     return f'<!-- github-review:{digest} -->'
 
 
@@ -320,7 +360,8 @@ def plain(value):
 
 
 def format_review(row, result):
-    lines = ['## 🤖 Generated by Codex', '', f"### Codex review · {row['model']}", f"Commit: `{row['head']}`", '',
+    name = NAMES[row['reviewer']]
+    lines = [f'## 🤖 Generated by {name}', '', f"### {name} review · {row['model']}", f"Commit: `{row['head']}`", '',
              'Scope: merge-base diff and full changed text files; no tests executed.', '']
     if not result['findings']:
         lines.append('No actionable findings in the reviewed scope.')
@@ -339,13 +380,23 @@ def format_review(row, result):
 class Generator:
     def __init__(self, settings, state):
         self.cfg, self.state = settings, state
-        self.git, self.codex = executable('git'), executable('codex')
-        self.auth = Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex'))) / 'auth.json'
+        self.git = executable('git')
+        self.binaries = {tool: executable(tool) for tool in settings['reviewers']}
+        self.auth = {'codex': Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex'))) / 'auth.json',
+                     'claude': Path(os.environ.get('CLAUDE_CONFIG_DIR', str(Path.home() / '.claude'))) / '.credentials.json'}
+        self.cancelled = threading.Event()
         self.gh = executable('gh')
         self.cache = state / 'cache'
         self.cache.mkdir(exist_ok=True)
         self.tmp = state / 'tmp'
         self.tmp.mkdir(exist_ok=True)
+
+    def cancel(self):
+        self.cancelled.set()
+
+    def check_cancelled(self):
+        if self.cancelled.is_set():
+            raise Failure('Review cancelled')
 
     def check_disk(self):
         size = sum(p.stat().st_size for p in self.cache.rglob('*') if p.is_file())
@@ -439,119 +490,214 @@ class Generator:
             shutil.rmtree(cache, ignore_errors=True)
             raise Limited('Review exceeds text/file/disk limits; manual review required')
 
-    def generate(self, row, pr):
-        prompt, files = self.context(row, pr)
+    def generate(self, row, prompt, files):
+        """Run one reviewer's model; safe to call from several threads at once."""
+        tool = row['reviewer']
+        schema = ROOT / 'review-schema.json'
         with tempfile.TemporaryDirectory(dir=self.tmp) as directory:
-            with worker(directory, self.codex, self.auth, ROOT / 'review-schema.json') as (args, home):
-                args += ['/codex', 'exec', '--ignore-user-config', '--ignore-rules',
-                         '--skip-git-repo-check', '--ephemeral', '--sandbox', 'read-only',
-                         '--model', row['model'], '--output-schema', '/schema.json',
-                         '-c', f'model_reasoning_effort="{self.cfg["reasoning_effort"]}"',
-                         '--output-last-message', '/home/worker/result.json', '--color', 'never',
-                         '-c', 'approval_policy="never"', '-c', 'forced_login_method="chatgpt"',
-                         '-c', 'project_doc_max_bytes=0', '-c', 'web_search="disabled"',
-                         '-c', 'features.shell_tool=false', '-c', 'features.unified_exec=false',
-                         '-c', 'features.apps=false', '-c', 'features.multi_agent=false',
-                         '-c', 'features.shell_snapshot=false',
-                         '-c', 'features.hooks=false', '-c', 'features.remote_plugin=false',
-                         '-c', 'features.browser_use=false', '-c', 'features.computer_use=false',
-                         '-c', 'features.image_generation=false', '-c', 'features.code_mode_host=false',
-                         '-c', 'features.skill_search=false', '-c', 'features.tool_suggest=false', '-']
-                command(args, data=prompt, env={'PATH': '/usr/bin:/bin'},
-                        timeout=self.cfg['review_timeout'], limit=1_000_000)
-                result_path = home / 'result.json'
-                if not result_path.is_file() or result_path.stat().st_size > 100000:
-                    raise Failure('Missing or oversized structured output')
+            with worker(directory, tool, self.binaries[tool], self.auth[tool], schema) as (args, home):
+                if tool == 'codex':
+                    args += ['/codex', 'exec', '--ignore-user-config', '--ignore-rules',
+                             '--skip-git-repo-check', '--ephemeral', '--sandbox', 'read-only',
+                             '--model', row['model'], '--output-schema', '/schema.json',
+                             '-c', f'model_reasoning_effort="{self.cfg["reasoning_effort"]}"',
+                             '--output-last-message', '/home/worker/result.json', '--color', 'never',
+                             '-c', 'approval_policy="never"', '-c', 'forced_login_method="chatgpt"',
+                             '-c', 'project_doc_max_bytes=0', '-c', 'web_search="disabled"',
+                             '-c', 'features.shell_tool=false', '-c', 'features.unified_exec=false',
+                             '-c', 'features.apps=false', '-c', 'features.multi_agent=false',
+                             '-c', 'features.shell_snapshot=false',
+                             '-c', 'features.hooks=false', '-c', 'features.remote_plugin=false',
+                             '-c', 'features.browser_use=false', '-c', 'features.computer_use=false',
+                             '-c', 'features.image_generation=false', '-c', 'features.code_mode_host=false',
+                             '-c', 'features.skill_search=false', '-c', 'features.tool_suggest=false', '-']
+                else:
+                    # No tools, MCP servers, skills, settings files or saved sessions.
+                    args += ['/claude', '--print', '--model', row['model'],
+                             '--effort', self.cfg['claude_reasoning_effort'],
+                             '--output-format', 'json', '--json-schema', schema.read_text(),
+                             '--tools', '', '--strict-mcp-config', '--setting-sources', '',
+                             '--disable-slash-commands', '--no-session-persistence']
+                output = command(args, data=prompt, env={'PATH': '/usr/bin:/bin'},
+                                 timeout=self.cfg['review_timeout'], limit=1_000_000,
+                                 guard=self.check_cancelled)
+                if tool == 'codex':
+                    result_path = home / 'result.json'
+                    if not result_path.is_file() or result_path.stat().st_size > 100000:
+                        raise Failure('Missing or oversized structured output')
+                    output = result_path.read_bytes()
                 try:
-                    result = json.loads(result_path.read_text())
+                    result = json.loads(output)
                 except (UnicodeError, json.JSONDecodeError) as exc:
                     raise Failure('Malformed structured review') from exc
+                if tool == 'claude':
+                    if not isinstance(result, dict) or result.get('is_error') or result.get('subtype') != 'success':
+                        raise Failure('Claude review did not succeed')
+                    result = result.get('structured_output')
+                    if len(json.dumps(result)) > 100000:
+                        raise Failure('Missing or oversized structured output')
                 return format_review(row, validate(result, files))
 
     def probe(self):
-        with tempfile.TemporaryDirectory(dir=self.tmp) as directory:
-            with worker(directory, self.codex, self.auth, ROOT / 'review-schema.json') as (args, _):
-                return command(args + ['--probe'], env={'PATH': '/usr/bin:/bin'}).decode().strip()
+        lines = []
+        for tool in self.cfg['reviewers']:
+            with tempfile.TemporaryDirectory(dir=self.tmp) as directory:
+                with worker(directory, tool, self.binaries[tool], self.auth[tool], ROOT / 'review-schema.json') as (args, _):
+                    lines.append(f'{tool}: ' + command(args + ['--probe'], env={'PATH': '/usr/bin:/bin'}).decode().strip())
+        return '\n'.join(lines)
 
 
-def process(db, row, gh, generator, cfg, user_id, dry_run=False):
-    started = time.monotonic()
-    stage = 'publication' if row['body'] else 'generation'
-    try:
-        # Reconcile before checking current PR state, including after a push or close.
-        if row['body'] and not dry_run:
-            published = gh.reconcile(row['repo'], row['number'], marker(row), user_id)
-            if published:
-                update(db, row, status='posted', publication_id=published, error=None)
-                return 'recovered'
-        pr = gh.pull(row['repo'], row['number'])
-        _, head, base = identity(pr)
-        if head != row['head'] or pr.get('state') != 'open':
-            update(db, row, status='superseded', body=None)
-            return
-        if pr.get('draft'):
-            update(db, row, next_retry=time.time() + cfg['retry_seconds'])
-            return
-        body = row['body']
-        if base != row['base']:
-            update(db, row, base=base, body=None, status='pending', generation_attempts=0,
-                   publication_attempts=0, next_retry=0)
-            return  # Next invocation reviews the new base, with the same head identity.
-        if body is None:
-            if row['generation_attempts'] >= cfg['max_attempts']:
-                update(db, row, status='failed', error='Interrupted generation exhausted retries')
-                return
-            count = row['generation_attempts'] + 1
-            update(db, row, generation_attempts=count)
-            body = generator.generate(row, pr)
-            update(db, row, body=body, status='generated', error=None, next_retry=0)
-        if dry_run:
-            print(body)
-            return
-        stage = 'publication'
-        if row['publication_attempts'] >= cfg['max_attempts']:
-            update(db, row, status='failed', error='Interrupted publication exhausted retries')
-            return
-        # A posting failure must not rerun generation, even across process restarts.
-        update(db, row, publication_attempts=row['publication_attempts'] + 1)
-        pr = gh.pull(row['repo'], row['number'])
-        _, head, base = identity(pr)
-        if head != row['head'] or pr.get('state') != 'open':
-            update(db, row, status='superseded', body=None)
-            return
-        if pr.get('draft'):
-            update(db, row, next_retry=time.time() + cfg['retry_seconds'])
-            return
-        if base != row['base']:
-            update(db, row, base=base, body=None, status='pending', generation_attempts=0,
-                   publication_attempts=0, next_retry=0)
-            return
-        published = gh.reconcile(row['repo'], row['number'], marker(row), user_id)
-        outcome = 'recovered'
-        if published is None:
-            published = gh.publish(row['repo'], row['number'], body)
-            outcome = 'posted'
-        update(db, row, status='posted', publication_id=published, error=None, next_retry=0)
-        return outcome
-    except Limited as exc:
+ERRORS = (Failure, OSError, RuntimeError, ValueError, KeyError)
+
+
+def fail(db, row, stage, exc, cfg):
+    if isinstance(exc, Limited):
         update(db, row, status='skipped', error=str(exc))
-    except (Failure, OSError, RuntimeError, ValueError, KeyError) as exc:
-        current = db.execute('SELECT * FROM revisions WHERE repo=? AND number=? AND head=?',
-                             (row['repo'], row['number'], row['head'])).fetchone()
-        count = max(1, current[stage + '_attempts'])
-        # Count failures that occurred before starting the stage too.
-        if current[stage + '_attempts'] == row[stage + '_attempts']:
-            count = current[stage + '_attempts'] + 1
-        status = 'failed' if count >= cfg['max_attempts'] else ('generated' if current['body'] else 'pending')
-        delay = max(cfg['retry_seconds'] * 2 ** min(count - 1, 8), getattr(exc, 'retry_after', 0))
-        error = str(exc) if isinstance(exc, Failure) else type(exc).__name__
-        update(db, row, status=status, error=error, next_retry=time.time() + delay,
-               **{stage + '_attempts': count})
-        LOG.error('%s #%s %s: %s', row['repo'], row['number'], stage, error)
+        return
+    current = db.execute('SELECT * FROM revisions WHERE repo=? AND number=? AND head=? AND reviewer=?',
+                         key(row)).fetchone()
+    count = max(1, current[stage + '_attempts'])
+    # Count failures that occurred before starting the stage too.
+    if current[stage + '_attempts'] == row[stage + '_attempts']:
+        count = current[stage + '_attempts'] + 1
+    status = 'failed' if count >= cfg['max_attempts'] else ('generated' if current['body'] else 'pending')
+    delay = max(cfg['retry_seconds'] * 2 ** min(count - 1, 8), getattr(exc, 'retry_after', 0))
+    error = str(exc) if isinstance(exc, Failure) else type(exc).__name__
+    update(db, row, status=status, error=error, next_retry=time.time() + delay,
+           **{stage + '_attempts': count})
+    LOG.error('%s #%s %s %s: %s', row['repo'], row['number'], row['reviewer'], stage, error)
+
+
+def recheck(db, rows, gh, cfg, stages):
+    """Fetch the PR once and keep only rows whose head, base and readiness still match."""
+    if not rows:
+        return None, []
+    try:
+        pr = gh.pull(rows[0]['repo'], rows[0]['number'])
+        _, head, base = identity(pr)
+    except ERRORS as exc:
+        for row in rows:
+            fail(db, row, stages[row['reviewer']], exc, cfg)
+        return None, []
+    kept = []
+    for row in rows:
+        if head != row['head'] or pr.get('state') != 'open':
+            update(db, row, status='superseded', body=None)
+        elif pr.get('draft'):
+            update(db, row, next_retry=time.time() + cfg['retry_seconds'])
+        elif base != row['base']:
+            # Next invocation reviews the new base, with the same head identity.
+            update(db, row, base=base, body=None, status='pending', generation_attempts=0,
+                   publication_attempts=0, next_retry=0)
+        else:
+            kept.append(row)
+    return pr, kept
+
+
+def generate(db, rows, pr, generator, cfg):
+    """Build the review input once, then run every reviewer's model in parallel."""
+    try:
+        prompt, files = generator.context(rows[0], pr)
+    except ERRORS as exc:
+        for row in rows:
+            fail(db, row, 'generation', exc, cfg)
+        return {}
+    results = {}
+
+    def run(row):
+        try:
+            results[row['reviewer']] = generator.generate(row, prompt, files)
+        except Exception as exc:  # Reported by the main thread.
+            results[row['reviewer']] = exc
+    threads = [threading.Thread(target=run, args=(row,), daemon=True) for row in rows]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    except BaseException:
+        generator.cancel()  # Kill model process groups before the interrupt propagates.
+        for thread in threads:
+            thread.join()
+        raise
+    bodies, unexpected = {}, None
+    for row in rows:
+        result = results[row['reviewer']]
+        if isinstance(result, ERRORS):
+            fail(db, row, 'generation', result, cfg)
+        elif isinstance(result, Exception):
+            unexpected = unexpected or result
+        else:
+            update(db, row, body=result, status='generated', error=None, next_retry=0)
+            bodies[row['reviewer']] = result
+    if unexpected:
+        raise unexpected
+    return bodies
+
+
+def process(db, rows, gh, generator, cfg, user_id, dry_run=False):
+    """Advance every reviewer of one PR head; each reviewer posts its own comment."""
+    started = time.monotonic()
+    outcomes, live = {}, []
+    stages = {row['reviewer']: 'publication' if row['body'] else 'generation' for row in rows}
+    try:
+        for row in rows:
+            try:
+                # Reconcile before checking current PR state, including after a push or close.
+                if row['body'] and not dry_run:
+                    published = gh.reconcile(row['repo'], row['number'], marker(row), user_id)
+                    if published:
+                        update(db, row, status='posted', publication_id=published, error=None)
+                        outcomes[row['reviewer']] = 'recovered'
+                        continue
+                live.append(row)
+            except ERRORS as exc:
+                fail(db, row, stages[row['reviewer']], exc, cfg)
+        pr, live = recheck(db, live, gh, cfg, stages)
+        bodies, waiting = {}, []
+        for row in live:
+            if row['body'] is not None:
+                bodies[row['reviewer']] = row['body']
+            elif row['generation_attempts'] >= cfg['max_attempts']:
+                update(db, row, status='failed', error='Interrupted generation exhausted retries')
+            else:
+                update(db, row, generation_attempts=row['generation_attempts'] + 1)
+                waiting.append(row)
+        if waiting:
+            bodies |= generate(db, waiting, pr, generator, cfg)
+        live = [row for row in live if row['reviewer'] in bodies]
+        if dry_run:
+            for row in live:
+                print(bodies[row['reviewer']])
+            return outcomes
+        ready = []
+        for row in live:
+            stages[row['reviewer']] = 'publication'
+            if row['publication_attempts'] >= cfg['max_attempts']:
+                update(db, row, status='failed', error='Interrupted publication exhausted retries')
+                continue
+            # A posting failure must not rerun generation, even across process restarts.
+            update(db, row, publication_attempts=row['publication_attempts'] + 1)
+            ready.append(row)
+        _, ready = recheck(db, ready, gh, cfg, stages)
+        for row in ready:
+            try:
+                published = gh.reconcile(row['repo'], row['number'], marker(row), user_id)
+                outcome = 'recovered'
+                if published is None:
+                    published = gh.publish(row['repo'], row['number'], bodies[row['reviewer']])
+                    outcome = 'posted'
+                update(db, row, status='posted', publication_id=published, error=None, next_retry=0)
+                outcomes[row['reviewer']] = outcome
+            except ERRORS as exc:
+                fail(db, row, 'publication', exc, cfg)
+        return outcomes
     finally:
-        update(db, row, duration=time.monotonic() - started)
+        duration = time.monotonic() - started
+        for row in rows:
+            update(db, row, duration=duration)
         with db:
-            db.execute('UPDATE repositories SET last_served=? WHERE name=?', (time.time(), row['repo']))
+            db.execute('UPDATE repositories SET last_served=? WHERE name=?', (time.time(), rows[0]['repo']))
 
 
 @contextlib.contextmanager
@@ -568,9 +714,16 @@ def lock(path):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def next_job(db, available, processed):
+def next_job(db, available, processed, reviewers=REVIEWERS):
+    """Return the due reviewer rows of the next PR head, Codex first."""
     rows = db.execute("SELECT v.* FROM revisions v JOIN repositories r ON r.name=v.repo WHERE v.status IN ('pending','generated') AND v.next_retry<=? ORDER BY r.last_served,v.discovered,v.number", (time.time(),)).fetchall()
-    return next((r for r in rows if r['repo'] in available and (r['repo'], r['number'], r['head']) not in processed), None)
+    rows = [r for r in rows if r['repo'] in available and r['reviewer'] in reviewers
+            and (r['repo'], r['number'], r['head']) not in processed]
+    if not rows:
+        return []
+    head = rows[0]['repo'], rows[0]['number'], rows[0]['head']
+    return sorted((r for r in rows if (r['repo'], r['number'], r['head']) == head),
+                  key=lambda r: REVIEWERS.index(r['reviewer']))
 
 
 def main(argv=None):
@@ -625,12 +778,13 @@ def run(args, cfg, state):
     posted = recovered = attempted = generated = 0
     if not args.status and not args.check:
         mode = 'publish' if args.publish else 'dry-run' if args.dry_run else 'discovery'
-        LOG.info('Run started: mode=%s repositories=%d reasoning_effort=%s',
-                 mode, len(cfg['repositories']), cfg['reasoning_effort'])
+        LOG.info('Run started: mode=%s repositories=%d reviewers=%s reasoning_effort=%s claude_reasoning_effort=%s',
+                 mode, len(cfg['repositories']), ','.join(cfg['reviewers']), cfg['reasoning_effort'],
+                 cfg['claude_reasoning_effort'])
     db = database(state / 'state.sqlite3')
     try:
         if args.status:
-            for row in db.execute('SELECT repo,number,head,status,generation_attempts,publication_attempts,error FROM revisions ORDER BY discovered'):
+            for row in db.execute('SELECT repo,number,head,reviewer,status,generation_attempts,publication_attempts,error FROM revisions ORDER BY discovered,reviewer'):
                 print(json.dumps(dict(row)))
             return 0
         gh = GitHub()
@@ -661,7 +815,7 @@ def run(args, cfg, state):
         for repo in cfg['repositories']:
             try:
                 pulls = gh.pulls(repo['name'])
-                discover(db, repo['name'], repo['model'], pulls, args.review_existing)
+                discover(db, repo['name'], repo['model'], pulls, args.review_existing, cfg['reviewers'])
                 LOG.info('Repository %s: %d open PRs', repo['name'], len(pulls))
                 available.append(repo['name'])
             except (Failure, KeyError, ValueError, OSError) as exc:
@@ -674,22 +828,27 @@ def run(args, cfg, state):
         if generator:
             processed = set()
             for _ in range(cfg['max_reviews']):
-                row = next_job(db, available, processed)
-                if row is None:
+                rows = next_job(db, available, processed, cfg['reviewers'])
+                if not rows:
                     break
-                processed.add((row['repo'], row['number'], row['head']))
-                attempted += 1
-                LOG.info('Review started: %s #%s head=%s', row['repo'], row['number'], row['head'][:12])
-                outcome = process(db, row, gh, generator, cfg, user_id, args.dry_run)
-                posted += outcome == 'posted'
-                recovered += outcome == 'recovered'
-                current = db.execute('SELECT status,error,body,duration FROM revisions WHERE repo=? AND number=? AND head=?',
-                                     (row['repo'], row['number'], row['head'])).fetchone()
-                generated += row['body'] is None and current['body'] is not None
-                LOG.info('Review finished: %s #%s status=%s outcome=%s duration=%.1fs',
-                         row['repo'], row['number'], current['status'], outcome or current['status'], current['duration'])
-                if current['error']:
-                    failures += 1
+                first = rows[0]
+                processed.add((first['repo'], first['number'], first['head']))
+                attempted += len(rows)
+                LOG.info('Review started: %s #%s head=%s reviewers=%s', first['repo'], first['number'],
+                         first['head'][:12], ','.join(r['reviewer'] for r in rows))
+                outcomes = process(db, rows, gh, generator, cfg, user_id, args.dry_run)
+                for row in rows:
+                    outcome = outcomes.get(row['reviewer'])
+                    posted += outcome == 'posted'
+                    recovered += outcome == 'recovered'
+                    current = db.execute('SELECT status,error,body,duration FROM revisions WHERE repo=? AND number=? AND head=? AND reviewer=?',
+                                         key(row)).fetchone()
+                    generated += row['body'] is None and current['body'] is not None
+                    LOG.info('Review finished: %s #%s %s status=%s outcome=%s duration=%.1fs',
+                             row['repo'], row['number'], row['reviewer'], current['status'],
+                             outcome or current['status'], current['duration'])
+                    if current['error']:
+                        failures += 1
         totals = dict(db.execute('SELECT status,COUNT(*) FROM revisions GROUP BY status').fetchall())
         LOG.info('Run finished: %d reviews posted, %d recovered, %d generated, %d attempted, %d errors; duration=%.1fs; state=%s',
                  posted, recovered, generated, attempted, failures, time.monotonic() - started, json.dumps(totals, sort_keys=True))

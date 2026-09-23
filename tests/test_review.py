@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -27,17 +28,21 @@ class ReviewerFixture(unittest.TestCase):
         self.gh.reconcile.return_value = None
         self.gh.publish.return_value = 42
         self.generator = Mock()
+        self.generator.context.return_value = ('review input', {})
         self.generator.generate.return_value = 'Validated body'
 
-    def seed(self, pulls=None, backfill=True):
-        review.discover(self.db, 'owner/repo', 'gpt-5.6-sol', [pr()] if pulls is None else pulls, backfill)
+    def seed(self, pulls=None, backfill=True, reviewers=('codex',)):
+        review.discover(self.db, 'owner/repo', 'gpt-5.6-sol', [pr()] if pulls is None else pulls, backfill, reviewers)
         return self.row()
 
-    def row(self, head='a' * 40):
-        return self.db.execute('SELECT * FROM revisions WHERE head=?', (head,)).fetchone()
+    def row(self, head='a' * 40, reviewer='codex'):
+        return self.db.execute("SELECT * FROM revisions WHERE repo='owner/repo' AND head=? AND reviewer=?", (head, reviewer)).fetchone()
+
+    def rows(self, head='a' * 40):
+        return self.db.execute("SELECT * FROM revisions WHERE repo='owner/repo' AND head=? ORDER BY reviewer DESC", (head,)).fetchall()
 
     def process(self, dry=False):
-        review.process(self.db, self.row(), self.gh, self.generator, self.cfg, 99, dry)
+        return review.process(self.db, self.rows(), self.gh, self.generator, self.cfg, 99, dry)
 
 
 class ReviewerTests(ReviewerFixture):
@@ -56,7 +61,7 @@ class ReviewerTests(ReviewerFixture):
 
     def test_baseline_per_repository(self):
         self.seed()
-        review.discover(self.db, 'other/repo', 'gpt-5.6-sol', [pr()], False)
+        review.discover(self.db, 'other/repo', 'gpt-5.6-sol', [pr()], False, ('codex',))
         self.assertEqual(self.db.execute("SELECT status FROM revisions WHERE repo='other/repo'").fetchone()[0], 'baseline')
 
     def test_unchanged_head_does_not_duplicate(self):
@@ -363,12 +368,12 @@ class RecoveryTests(ReviewerFixture):
 
     def test_fairness_and_retry_times(self):
         self.seed([pr(), pr('c' * 40, number=2)])
-        review.discover(self.db, 'other/repo', 'gpt-5.6-sol', [pr()], True)
+        review.discover(self.db, 'other/repo', 'gpt-5.6-sol', [pr()], True, ('codex',))
         self.process()
-        row = review.next_job(self.db, ['owner/repo', 'other/repo'], set())
+        [row] = review.next_job(self.db, ['owner/repo', 'other/repo'], set())
         self.assertEqual(row['repo'], 'other/repo')
         review.update(self.db, row, next_retry=review.time.time() + 100)
-        row = review.next_job(self.db, ['owner/repo', 'other/repo'], set())
+        [row] = review.next_job(self.db, ['owner/repo', 'other/repo'], set())
         self.assertEqual(row['number'], 2)
 
 
@@ -401,6 +406,7 @@ class RunnerTests(unittest.TestCase):
             gen.cache = root / 'cache'
             gen.tmp.mkdir()
             gen.cache.mkdir()
+            gen.context.return_value = ('review input', {})
             gen.generate.return_value = 'preview'
             with patch('review.GitHub', return_value=gh), patch('review.Generator', return_value=gen), contextlib.redirect_stdout(io.StringIO()):
                 review.main(['--config', str(cfg), '--state-dir', str(root / 'state'), '--dry-run', '--review-existing'])
@@ -413,7 +419,7 @@ class RunnerTests(unittest.TestCase):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 cfg = root / 'repos.json'
-                cfg.write_text(json.dumps({'repositories': ['owner/repo']}))
+                cfg.write_text(json.dumps({'repositories': ['owner/repo'], 'reviewers': ['codex']}))
                 state = root / 'state'
                 state.mkdir()
                 gh = Mock()
@@ -426,10 +432,11 @@ class RunnerTests(unittest.TestCase):
                 gen.tmp, gen.cache = root / 'tmp', root / 'cache'
                 gen.tmp.mkdir()
                 gen.cache.mkdir()
+                gen.context.return_value = ('review input', {})
                 gen.generate.return_value = 'validated body'
                 if scenario == 'recovered':
                     db = review.database(state / 'state.sqlite3')
-                    review.discover(db, 'owner/repo', 'gpt-5.6-sol', [pr()], True)
+                    review.discover(db, 'owner/repo', 'gpt-5.6-sol', [pr()], True, ('codex',))
                     row = db.execute('SELECT * FROM revisions').fetchone()
                     review.update(db, row, status='generated', body='saved body')
                     db.close()
@@ -502,14 +509,14 @@ class ReasoningTests(unittest.TestCase):
             root = Path(directory)
             cfg = review.DEFAULTS | {'reasoning_effort': 'high'}
             gen = review.Generator(cfg, root)
-            row = dict(repo='owner/repo', number=1, head='a' * 40, model='gpt-5.6-sol')
+            row = dict(repo='owner/repo', number=1, head='a' * 40, reviewer='codex', model='gpt-5.6-sol')
             @contextlib.contextmanager
             def fake_worker(directory, *args):
                 home = Path(directory)
                 (home / 'result.json').write_text(json.dumps({'complete': True, 'limitations': [], 'findings': []}))
                 yield ['isolated-worker'], home
-            with patch.object(gen, 'context', return_value=('review input', {})), patch('review.worker', fake_worker), patch('review.command') as command:
-                gen.generate(row, pr())
+            with patch('review.worker', fake_worker), patch('review.command') as command:
+                gen.generate(row, 'review input', {})
             args = command.call_args.args[0]
             index = args.index('model_reasoning_effort="high"')
             self.assertEqual(args[index - 1], '-c')
@@ -546,6 +553,187 @@ class AuthRefreshTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     isolation.save_refreshed_auth(auth, original, copy)
                 self.assertEqual(auth.read_bytes(), original)
+
+
+class ClaudeTests(ReviewerFixture):
+    def test_new_head_gets_one_row_per_reviewer(self):
+        self.seed(reviewers=review.REVIEWERS)
+        self.assertEqual({(r['reviewer'], r['model']) for r in self.rows()},
+                         {('codex', 'gpt-5.6-sol'), ('claude', 'claude-opus-5-5')})
+
+    def test_both_reviews_post_separate_comments(self):
+        self.seed(reviewers=review.REVIEWERS)
+        self.generator.generate.side_effect = lambda row, prompt, files: f"{row['reviewer']} body"
+        self.gh.publish.side_effect = [1, 2]
+        self.assertEqual(self.process(), {'codex': 'posted', 'claude': 'posted'})
+        self.generator.context.assert_called_once()
+        self.assertEqual([c.args[2] for c in self.gh.publish.call_args_list], ['codex body', 'claude body'])
+        self.assertEqual({r['reviewer']: r['publication_id'] for r in self.rows()}, {'codex': 1, 'claude': 2})
+        self.gh.pull.assert_called()
+        self.assertEqual(self.gh.pull.call_count, 2)  # Once before generation, once before posting.
+
+    def test_models_run_in_parallel(self):
+        self.seed(reviewers=review.REVIEWERS)
+        barrier = threading.Barrier(2, timeout=5)
+        def generate(row, prompt, files):
+            barrier.wait()  # Raises BrokenBarrierError if the calls were sequential.
+            return 'body'
+        self.generator.generate.side_effect = generate
+        self.assertEqual(self.process(), {'codex': 'posted', 'claude': 'posted'})
+
+    def test_one_reviewer_failing_does_not_block_the_other(self):
+        self.seed(reviewers=review.REVIEWERS)
+        def generate(row, prompt, files):
+            if row['reviewer'] == 'claude':
+                raise review.Failure('claude exited 1')
+            return 'codex body'
+        self.generator.generate.side_effect = generate
+        self.assertEqual(self.process(), {'codex': 'posted'})
+        self.gh.publish.assert_called_once()
+        claude = self.row(reviewer='claude')
+        self.assertEqual((claude['status'], claude['generation_attempts'], claude['error']),
+                         ('pending', 1, 'claude exited 1'))
+        self.assertEqual(self.row()['status'], 'posted')
+
+    def test_context_limit_skips_every_reviewer(self):
+        self.seed(reviewers=review.REVIEWERS)
+        self.generator.context.side_effect = review.Limited('oversized')
+        self.process()
+        self.assertEqual({r['status'] for r in self.rows()}, {'skipped'})
+        self.generator.generate.assert_not_called()
+
+    def test_markers_are_distinct_and_codex_marker_is_unchanged(self):
+        self.seed(reviewers=review.REVIEWERS)
+        codex, claude = self.row(), self.row(reviewer='claude')
+        legacy = review.hashlib.sha256(f"owner/repo:1:{'a' * 40}".encode()).hexdigest()
+        self.assertEqual(review.marker(codex), f'<!-- github-review:{legacy} -->')
+        self.assertNotEqual(review.marker(claude), review.marker(codex))
+
+    def test_claude_comment_header(self):
+        self.seed(reviewers=review.REVIEWERS)
+        body = review.format_review(self.row(reviewer='claude'), {'complete': True, 'limitations': [], 'findings': []})
+        self.assertTrue(body.startswith('## 🤖 Generated by Claude\n\n### Claude review · claude-opus-5-5\n'))
+
+    def test_disabled_reviewer_is_not_scheduled(self):
+        self.seed(reviewers=review.REVIEWERS)
+        self.assertEqual([r['reviewer'] for r in review.next_job(self.db, ['owner/repo'], set())], ['codex', 'claude'])
+        self.assertEqual([r['reviewer'] for r in review.next_job(self.db, ['owner/repo'], set(), ['codex'])], ['codex'])
+
+    def test_known_heads_are_not_backfilled_for_claude(self):
+        self.seed()
+        self.process()
+        self.seed([pr(), pr('c' * 40, number=2)], backfill=False, reviewers=review.REVIEWERS)
+        self.assertEqual([r['reviewer'] for r in self.rows()], ['codex'])
+        self.assertEqual(len(self.rows('c' * 40)), 2)
+
+
+class MigrationTests(unittest.TestCase):
+    def test_existing_state_becomes_codex_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.sqlite3'
+            old = review.sqlite3.connect(path)
+            old.executescript('''
+            CREATE TABLE revisions(
+              repo TEXT NOT NULL, number INTEGER NOT NULL, head TEXT NOT NULL, base TEXT NOT NULL,
+              model TEXT NOT NULL, status TEXT NOT NULL, discovered REAL NOT NULL,
+              generation_attempts INTEGER NOT NULL DEFAULT 0, publication_attempts INTEGER NOT NULL DEFAULT 0,
+              next_retry REAL NOT NULL DEFAULT 0, body TEXT, publication_id INTEGER,
+              error TEXT, duration REAL, updated REAL NOT NULL,
+              PRIMARY KEY(repo, number, head));
+            INSERT INTO revisions(repo,number,head,base,model,status,discovered,body,publication_id,updated)
+              VALUES('owner/repo',1,'h','b','gpt-6-astra','posted',1,'body',7,2);
+            ''')
+            old.commit()
+            old.close()
+            for _ in range(2):  # Migration is idempotent.
+                db = review.database(path)
+                row = db.execute('SELECT * FROM revisions').fetchone()
+                self.assertEqual((row['reviewer'], row['status'], row['body'], row['publication_id']),
+                                 ('codex', 'posted', 'body', 7))
+                db.close()
+
+
+class ClaudeGeneratorTests(unittest.TestCase):
+    def run_claude(self, output):
+        with tempfile.TemporaryDirectory() as directory:
+            gen = review.Generator(review.DEFAULTS | {'claude_reasoning_effort': 'max'}, Path(directory))
+            row = dict(repo='owner/repo', number=1, head='a' * 40, reviewer='claude', model='claude-opus-5-5')
+            @contextlib.contextmanager
+            def fake_worker(directory, tool, *args):
+                self.assertEqual(tool, 'claude')
+                yield ['isolated-worker'], Path(directory)
+            with patch('review.worker', fake_worker), patch('review.command', return_value=json.dumps(output).encode()) as command:
+                body = gen.generate(row, 'review input', {})
+            return body, command.call_args
+
+    def test_claude_invocation_and_structured_output(self):
+        output = {'type': 'result', 'subtype': 'success', 'is_error': False,
+                  'structured_output': {'complete': True, 'limitations': [], 'findings': []}}
+        body, call = self.run_claude(output)
+        self.assertIn('Generated by Claude', body)
+        args = call.args[0]
+        self.assertEqual(args[args.index('--model') + 1], 'claude-opus-5-5')
+        self.assertEqual(args[args.index('--effort') + 1], 'max')
+        self.assertEqual(args[args.index('--tools') + 1], '')
+        self.assertEqual(json.loads(args[args.index('--json-schema') + 1])['required'], ['complete', 'limitations', 'findings'])
+        self.assertIn('--no-session-persistence', args)
+        self.assertEqual(call.kwargs['data'], 'review input')
+
+    def test_claude_errors_are_rejected(self):
+        for output in ({'subtype': 'success', 'is_error': True, 'structured_output': {}},
+                       {'subtype': 'error_max_turns', 'is_error': False},
+                       {'subtype': 'success', 'is_error': False, 'structured_output': {'complete': False, 'limitations': [], 'findings': []}}):
+            with self.subTest(output=output), self.assertRaises(review.Failure):
+                self.run_claude(output)
+
+    def test_cancel_stops_running_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            gen = review.Generator(review.DEFAULTS, Path(directory))
+            gen.check_cancelled()
+            gen.cancel()
+            with self.assertRaises(review.Failure):
+                review.command([sys.executable, '-c', 'import time;time.sleep(10)'], guard=gen.check_cancelled)
+
+    def test_claude_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'repos.json'
+            path.write_text('{}')
+            self.assertEqual(review.config(path)['claude_reasoning_effort'], 'high')
+            self.assertEqual(review.config(path)['reviewers'], ['codex', 'claude'])
+            for bad in ({'claude_reasoning_effort': 'ultra'}, {'reviewers': []}, {'reviewers': ['gemini']},
+                        {'reviewers': ['codex', 'codex']}, {'reviewers': 'codex'}):
+                with self.subTest(bad=bad), self.assertRaises(review.Failure):
+                    path.write_text(json.dumps(bad))
+                    review.config(path)
+
+    def test_claude_relay_allowlist(self):
+        claude = isolation.ALLOWED_HOSTS['claude']
+        for authority in ('chatgpt.com:443', 'claude.ai:443', 'api.anthropic.com:80'):
+            with self.subTest(authority=authority), self.assertRaises(ValueError):
+                isolation.destination(authority, claude)
+        with patch('isolation.socket.getaddrinfo', return_value=[(2, 1, 6, '', ('160.79.104.10', 443))]):
+            isolation.destination('api.anthropic.com:443', claude)
+        with self.assertRaises(ValueError):
+            isolation.destination('api.anthropic.com:443')  # Codex relay does not reach Anthropic.
+
+    def test_claude_refresh_persists_only_valid_subscription_login(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            auth, copy = root / 'credentials.json', root / 'copy.json'
+            before = {'claudeAiOauth': {'accessToken': 'old', 'refreshToken': 'old', 'subscriptionType': 'max'}}
+            after = {'claudeAiOauth': {'accessToken': 'new', 'refreshToken': 'new', 'subscriptionType': 'max'}}
+            original = json.dumps(before).encode()
+            auth.write_bytes(original)
+            for bad in ({'claudeAiOauth': {'accessToken': 'new', 'refreshToken': ''}},
+                        after | {'primaryApiKey': 'key'},
+                        {'claudeAiOauth': after['claudeAiOauth'] | {'subscriptionType': 'pro'}}):
+                copy.write_text(json.dumps(bad))
+                with self.subTest(bad=bad), self.assertRaises(RuntimeError):
+                    isolation.save_refreshed_auth(auth, original, copy, 'claude')
+                self.assertEqual(auth.read_bytes(), original)
+            copy.write_text(json.dumps(after))
+            isolation.save_refreshed_auth(auth, original, copy, 'claude')
+            self.assertEqual(json.loads(auth.read_text()), after)
 
 
 if __name__ == '__main__':

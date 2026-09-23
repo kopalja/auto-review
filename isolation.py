@@ -14,7 +14,12 @@ import sys
 import tempfile
 import threading
 
-ALLOWED_HOSTS = frozenset({'chatgpt.com', 'auth.openai.com', 'api.openai.com'})
+ALLOWED_HOSTS = {
+    'codex': frozenset({'chatgpt.com', 'auth.openai.com', 'api.openai.com'}),
+    'claude': frozenset({'api.anthropic.com', 'platform.claude.com', 'console.anthropic.com'}),
+}
+# Where each tool keeps its subscription login, relative to the worker home.
+CREDENTIALS = {'codex': Path('.codex/auth.json'), 'claude': Path('.claude/.credentials.json')}
 
 
 def relay(left, right):
@@ -31,9 +36,9 @@ def relay(left, right):
             (right if source is left else left).sendall(data)
 
 
-def destination(authority):
+def destination(authority, allowed=ALLOWED_HOSTS['codex']):
     host, sep, port = authority.lower().rpartition(':')
-    if not sep or port != '443' or host not in ALLOWED_HOSTS:
+    if not sep or port != '443' or host not in allowed:
         raise ValueError('destination denied')
     addresses = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
     if not addresses or any(not ipaddress.ip_address(a[4][0]).is_global for a in addresses):
@@ -54,7 +59,7 @@ class Gateway(socketserver.BaseRequestHandler):
             method, authority, version = header.split(b'\r\n', 1)[0].decode('ascii').split()
             if method != 'CONNECT' or version not in ('HTTP/1.0', 'HTTP/1.1'):
                 raise ValueError('CONNECT required')
-            addresses = destination(authority)
+            addresses = destination(authority, self.server.allowed)
             for family, kind, proto, _, address in addresses:
                 remote = socket.socket(family, kind, proto)
                 remote.settimeout(15)
@@ -75,8 +80,12 @@ class Gateway(socketserver.BaseRequestHandler):
 
 class UnixServer(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
-    # Bound relay threads independently of model behavior.
-    slots = threading.BoundedSemaphore(16)
+
+    def __init__(self, path, handler, allowed):
+        super().__init__(path, handler)
+        self.allowed = allowed
+        # Bound relay threads independently of model behavior.
+        self.slots = threading.BoundedSemaphore(16)
 
     def process_request(self, request, client_address):
         if not self.slots.acquire(blocking=False):
@@ -105,18 +114,33 @@ class Bridge(socketserver.BaseRequestHandler):
             pass
 
 
-def save_refreshed_auth(auth, original, copy):
+def check_login(tool, data):
+    """Accept only a subscription login; never an API key."""
+    if tool == 'codex':
+        tokens = data.get('tokens')
+        return (data.get('auth_mode') == 'chatgpt' and not data.get('OPENAI_API_KEY')
+                and isinstance(tokens, dict) and tokens)
+    oauth = data.get('claudeAiOauth')
+    return (isinstance(oauth, dict) and not data.get('primaryApiKey')
+            and all(isinstance(oauth.get(k), str) and oauth[k] for k in ('accessToken', 'refreshToken')))
+
+
+def save_refreshed_auth(auth, original, copy, tool='codex'):
     """Keep unattended refreshes, without overwriting a newer host login."""
     updated = copy.read_bytes()
     if updated == original or auth.read_bytes() != original:
         return
     before, after = json.loads(original), json.loads(updated)
-    if (after.get('auth_mode') != 'chatgpt' or after.get('OPENAI_API_KEY')
-            or not isinstance(after.get('tokens'), dict)
-            or after['tokens'].get('account_id') != before['tokens'].get('account_id')
-            or not all(isinstance(after['tokens'].get(k), str) and after['tokens'][k]
-                       for k in ('access_token', 'refresh_token', 'id_token'))):
-        raise RuntimeError('Invalid refreshed ChatGPT credentials')
+    if tool == 'codex':
+        valid = (check_login(tool, after)
+                 and after['tokens'].get('account_id') == before['tokens'].get('account_id')
+                 and all(isinstance(after['tokens'].get(k), str) and after['tokens'][k]
+                         for k in ('access_token', 'refresh_token', 'id_token')))
+    else:
+        valid = (check_login(tool, after) and set(after) <= set(before)
+                 and after['claudeAiOauth'].get('subscriptionType') == before['claudeAiOauth'].get('subscriptionType'))
+    if not valid:
+        raise RuntimeError('Invalid refreshed subscription credentials')
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(dir=auth.parent, delete=False) as handle:
@@ -132,7 +156,7 @@ def save_refreshed_auth(auth, original, copy):
 
 
 @contextlib.contextmanager
-def worker(directory, codex, auth, schema):
+def worker(directory, tool, binary, auth, schema):
     """Expose only runtime files, a disposable home, and an allowlisted relay."""
     bwrap = shutil.which('bwrap')
     if not bwrap:
@@ -140,18 +164,22 @@ def worker(directory, codex, auth, schema):
     directory = Path(directory).resolve()
     home = directory / 'home'
     home.mkdir(mode=0o700)
-    codex_home = home / '.codex'
-    codex_home.mkdir(mode=0o700)
     auth = Path(auth)
     original = auth.read_bytes()
-    credentials = json.loads(original)
-    if credentials.get('auth_mode') != 'chatgpt' or not credentials.get('tokens'):
-        raise RuntimeError('Existing Codex ChatGPT file login required')
-    auth_copy = codex_home / 'auth.json'
+    if not check_login(tool, json.loads(original)):
+        raise RuntimeError(f'Existing {tool} subscription file login required')
+    auth_copy = home / CREDENTIALS[tool]
+    auth_copy.parent.mkdir(mode=0o700)
     auth_copy.write_bytes(original)
     auth_copy.chmod(0o600)
+    environment = ['--setenv', 'CODEX_HOME', '/home/worker/.codex']
+    if tool == 'claude':
+        # Skip first-run onboarding; disable updates, telemetry and error reporting.
+        (home / '.claude.json').write_text(json.dumps({'hasCompletedOnboarding': True}))
+        environment = ['--setenv', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', '1',
+                       '--setenv', 'DISABLE_AUTOUPDATER', '1']
     sock = directory / 'relay.sock'
-    server = UnixServer(str(sock), Gateway)
+    server = UnixServer(str(sock), Gateway, ALLOWED_HOSTS[tool])
     sock.chmod(0o600)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -165,13 +193,12 @@ def worker(directory, codex, auth, schema):
     args += ['--dir', '/etc', '--ro-bind', '/etc/ssl/certs', '/etc/ssl/certs',
              '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
              '--bind', str(home), '/home/worker',
-             '--ro-bind', str(Path(codex).resolve()), '/codex',
+             '--ro-bind', str(Path(binary).resolve()), f'/{tool}',
              '--ro-bind', str(Path(__file__).resolve()), '/isolation.py',
              '--ro-bind', str(Path(schema).resolve()), '/schema.json',
              '--ro-bind', str(sock), '/relay.sock',
              '--dir', '/review', '--chdir', '/review',
-             '--setenv', 'HOME', '/home/worker',
-             '--setenv', 'CODEX_HOME', '/home/worker/.codex',
+             '--setenv', 'HOME', '/home/worker', *environment,
              '--setenv', 'PATH', '/usr/bin:/bin', '--setenv', 'LANG', 'C.UTF-8',
              '/usr/bin/python3', '/isolation.py']
     try:
@@ -180,7 +207,7 @@ def worker(directory, codex, auth, schema):
         server.shutdown()
         server.server_close()
         thread.join()
-        save_refreshed_auth(auth, original, auth_copy)
+        save_refreshed_auth(auth, original, auth_copy, tool)
 
 
 def main():
