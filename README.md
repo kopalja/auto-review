@@ -121,10 +121,10 @@ Retries preserve already-generated output after a posting failure. Deterministic
 
 ## Scheduling
 
-Monitoring is scheduled every 10 minutes in `kopi`'s crontab, using this entry:
+Monitoring is scheduled every 5 minutes in `kopi`'s crontab, using this entry:
 
 ```cron
-*/10 * * * * TZ=Europe/Bratislava /home/kopi/automations/github-review/bin/run --publish 2>&1 | /usr/bin/logger -t github-review
+*/5 * * * * TZ=Europe/Bratislava /home/kopi/automations/github-review/bin/run --publish 2>&1 | /usr/bin/logger -t github-review
 ```
 
 The runner sets its working directory and PATH, uses absolute resolved executable paths, lowers CPU priority, and acquires `flock` through Python's `fcntl`. Cron must use the same HOME and any custom CODEX_HOME/GH_CONFIG_DIR used during setup. One shared worker lock excludes production and dry-run model work. Overlapping invocations exit successfully.
