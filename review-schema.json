@@ -1,10 +1,13 @@
 {
   "type": "object",
   "additionalProperties": false,
-  "required": ["complete", "limitations", "findings"],
+  "required": ["complete", "limitations", "summary", "approach", "verdict", "findings"],
   "properties": {
     "complete": {"type": "boolean"},
     "limitations": {"type": "array", "items": {"type": "string"}},
+    "summary": {"type": "string"},
+    "approach": {"type": "string"},
+    "verdict": {"type": "string", "enum": ["sound", "rework", "restart"]},
     "findings": {
       "type": "array",
       "items": {

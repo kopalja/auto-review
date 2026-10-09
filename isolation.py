@@ -156,8 +156,8 @@ def save_refreshed_auth(auth, original, copy, tool='codex'):
 
 
 @contextlib.contextmanager
-def worker(directory, tool, binary, auth, schema):
-    """Expose only runtime files, a disposable home, and an allowlisted relay."""
+def worker(directory, tool, binary, auth, schema, repo=None):
+    """Expose only runtime files, a disposable home, an optional read-only repo, and an allowlisted relay."""
     bwrap = shutil.which('bwrap')
     if not bwrap:
         raise RuntimeError('Bubblewrap missing: install bubblewrap')
@@ -197,7 +197,8 @@ def worker(directory, tool, binary, auth, schema):
              '--ro-bind', str(Path(__file__).resolve()), '/isolation.py',
              '--ro-bind', str(Path(schema).resolve()), '/schema.json',
              '--ro-bind', str(sock), '/relay.sock',
-             '--dir', '/review', '--chdir', '/review',
+             *(['--ro-bind', str(Path(repo).resolve()), '/review'] if repo else ['--dir', '/review']),
+             '--chdir', '/review',
              '--setenv', 'HOME', '/home/worker', *environment,
              '--setenv', 'PATH', '/usr/bin:/bin', '--setenv', 'LANG', 'C.UTF-8',
              '/usr/bin/python3', '/isolation.py']
